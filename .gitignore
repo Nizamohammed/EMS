@@ -1,5 +1,6 @@
-# In-roll repo for inspo
-/Users/nzm/EMS/archive
+# In-roll repo for inspo (embedded git repo — keep out of this repo)
+archive/
 
 
 .idea/
+.DS_Store
