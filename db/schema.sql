@@ -129,7 +129,8 @@ create table roll (
     date_of_publication  date,                 -- latest-per-state = max(date_of_publication)
     date_of_updation     date,                 -- footer "Date of Updation" (roll-level / latest)
     roll_identification  text,                 -- verbatim, e.g. "Final Integrated Roll of ..." (mother-roll value)
-    roll_type            text not null check (roll_type in ('SIR_FinalRoll','SIR_DraftRoll','Supplement')),
+    roll_type            text not null check (roll_type in
+                             ('SIR_FinalRoll','SIR_DraftRoll','FinalRoll','DraftRoll','Supplement')),
     revision_no          integer,              -- nullable (Draft rolls may lack a Revision token); see uq_roll_natural
     language_code        text not null check (language_code ~ '^[A-Z]{2,3}$'),  -- ENG, HIN, TAM, ...
                                                -- NOTE: normalize on ingest (ENG not EN/English); promote to a
