@@ -1,0 +1,17 @@
+{
+  "name": "ems-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EMS electoral-roll download pipeline: manifest crawler (open ECI catalog) + browser-driven per-part downloader.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "crawl": "node bin/crawl-manifest.js",
+    "stats": "node bin/crawl-manifest.js --stats-only"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}

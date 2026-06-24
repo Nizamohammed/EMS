@@ -4,3 +4,15 @@ archive/
 
 .idea/
 .DS_Store
+
+# Scraper subsystem: never commit dependencies, downloaded rolls (PII), or the
+# operational manifest DB. Code under scraper/ IS committed; data is not.
+scraper/node_modules/
+scraper/data/
+*.db
+*.db-journal
+*.db-wal
+
+# Python bytecode
+__pycache__/
+*.pyc
