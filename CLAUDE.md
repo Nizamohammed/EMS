@@ -9,8 +9,10 @@
 - We **proved end-to-end** that we can download a real electoral-roll PDF from the official ECI portal (headless browser, captcha solved by the agent's vision, **no login/OTP needed**). A valid 12-page roll was downloaded and inspected.
 - We discovered the roll PDFs have **NO text layer → OCR is mandatory**.
 - **Current decision:** we chose **Option 2** = first understand the PDF structure → design the database model → then build OCR. (Not yet building the full download pipeline.)
-- **✅ DONE: full structural survey + data model.** The PDF structure is fully mapped (see `roll_pdf_structure_verified` memory) and the **core PostgreSQL schema is written and validated** at `db/schema.sql` — syntax-checked (pglast), adversarially reviewed (multi-agent), and **executed on real Postgres 16** (loads clean; the QC reconciliation view + all constraints behave correctly on a sample-data slice).
-- **Immediate next step:** build the **OCR/extraction** pass (Option-2 step B) that reads the sample PDF's voter pages and populates `db/schema.sql`, reconciled against the page-12 summary (all 226 real electors). Optionally still grab roll *variants* (native-language + Draft) to stress the schema.
+- **✅ DONE: full structural survey + data model.** The PDF structure is fully mapped (see `roll_pdf_structure_verified` memory) and the **core PostgreSQL schema is written and validated** at `db/schema.sql` — syntax-checked, adversarially reviewed (multi-agent), and **executed on real Postgres 16** (loads clean; the QC reconciliation view + all constraints behave correctly on real extracted data).
+- **✅ DONE: OCR/extraction pipeline built** at `ocr/` (see §17). PDF → rasterize → **pluggable VLM extractor** → assemble (dedupe + status) → reconcile vs the summary oracle → **DB loader** into `db/schema.sql`. The full PDF→OCR→DB→reconcile vertical was proven on the Lakshadweep sample (`reconciles=true`, 226 electors). Validated on a 2nd roll (Telangana S29-61, integrated SSR FinalRoll).
+- **Model decision (locked):** Tier-A English = **Qwen3-VL-8B (Apache-2.0)** on GPU; bake-off comparators = Chandra-2, DeepSeek-OCR-2. `qwen2.5vl:3b` on a Mac M3/16GB works but is slow + suffers field-overload (drops EPIC) → Mac is for dev/validation, GPU for the corpus.
+- **Immediate next step:** the **GPU is provisioned** (AWS, separate session — see §18). Run the **model bake-off** (`--extractor vllm` against the served model) on the two sample rolls, score vs their summary pages, then confirm Qwen3-VL-8B and scale.
 
 ---
 
@@ -177,9 +179,60 @@ Original entity thinking (preserved for context — now realized in `db/schema.s
 ---
 
 ## 16. Immediate next step
-Structural survey ✅ and data model ✅ are done (`db/schema.sql`, validated on Postgres 16). **Next = OCR/extraction (Option-2 step B):**
-- Build the pass that rasterizes the sample PDF's voter pages (`pdftoppm`, already done at `~/eci_spike/scan/`) and extracts each card's fields → loads `elector`/`roll`/`summary`/etc.
-- **Validate against the page-12 summary** on all 226 real electors via `v_roll_reconciliation` (must return `reconciles=true`) — the free QC oracle.
-- Evaluate OCR options on the voter grid (vision LLM vs Google Vision vs Tesseract); English roll first.
-- Then: build the download→OCR→DB vertical for one part → only then scale the pipeline.
-- Optional hardening: pull roll *variants* (native-language + Draft) to stress the schema before scaling.
+Structural survey ✅, data model ✅, and the OCR pipeline ✅ are done. **Next = the GPU model bake-off** (§17 + §18): serve Qwen3-VL-8B (and Chandra-2 / DeepSeek-OCR-2) on the AWS GPU, run `ocr/` against them with `--extractor vllm`, score vs the summary oracle on the two sample rolls, confirm the model, then scale to the download→OCR→DB pipeline.
+
+---
+
+## 17. OCR / extraction pipeline (BUILT — `ocr/`)
+Stdlib-only Python package; no pip deps (uses `pdftoppm` + stdlib HTTP). Run: `python3 -m ocr.cli <roll.pdf> --extractor <name> [--dpi N --max-voter-pages N --sql-out roll.sql --out result.json -v]`.
+
+**Flow:** `rasterize.py` (PDF → cover / voter half-page crops / summary PNGs; crop bands scale with `--dpi`) → **pluggable `Extractor`** (`ocr/extractors/`) → `assemble.py` (normalize, dedupe by serial, infer status active/deleted/added/modified, structural QA confidence) → `reconcile.py` (counts/gender vs the summary; mirrors `v_roll_reconciliation`) → `load.py` (`--sql-out` → psql-loadable SQL for `db/schema.sql`, incl. Tier-1 person/placement).
+
+**Extractor is the swap point** — `extract(image, json_schema, instruction) -> json`. Registered: `qwen2.5vl` (local Ollama, Mac), `vllm` (remote vLLM OpenAI-compatible API — the GPU path; `--model Qwen/Qwen3-VL-8B-Instruct --host http://<gpu>:8000`), `mock` (no-model wiring test). New engine = one new file, zero pipeline change.
+
+**Key learnings (see `ocr_vertical_proven` memory):**
+- Vision extraction nails counts/gender/status (oracle-verified); field text (EPIC digits) needs the structural fidelity gate (`[A-Z]{3}[0-9]{7}`).
+- **Field-overload:** a small (3B) model drops hard fields (EPIC, relation_name) when asked for ~10 fields × ~18 cards in one call; it reads them perfectly when the call is scoped. Fix = stronger model (8B does the full schema in one call) OR scoped multi-pass. → GPU + Qwen3-VL-8B chosen.
+- Cross-state ENUM/label variance (reservation GENERAL vs GEN; roll_type FinalRoll vs SIR_FinalRoll; area labels) → loader normalizes; schema CHECKs kept tolerant.
+- Mac M3/16GB: ~80–186s per half-page call with `qwen2.5vl:3b` → fine for dev/validation, too slow for the corpus.
+- **Indic (deferred):** `language_code` (known from the download manifest) routes to a specialist later; no native-language roll obtained yet. Tier-B bake-off (Sarvam/Google DocAI/Bhashini/Indic-tuned open models) when one is available.
+
+---
+
+## 18. AWS GPU / serving — ✅ PROVISIONED (2026-06-24)
+**Account 122445004152, region ap-south-1 (Mumbai).** GPU quota ("Running On-Demand G and VT instances", L-DB2E81BA) was 0; AWS denied the first request, **approved on appeal** → now **8 vCPUs**.
+
+**Standing resources (do not recreate):**
+- Instance: **`i-06267ed13fcb663b4`** — `g6.xlarge` (NVIDIA **L4 24GB**), AMI `ami-08e5eee927d4b1622` (Deep Learning Base GPU Ubuntu 22.04, drivers+CUDA+Docker+nvidia-runtime preinstalled), 150GB gp3 root. SSH user `ubuntu`. **Currently STOPPED** (model weights + vLLM container preserved on disk).
+- Key pair `ems-gpu` → private key at `~/.ssh/ems-gpu.pem` (chmod 600).
+- Security group **`sg-0680b4005b958b5c8`** — SSH(22) only; allows `91.148.246.0/24` (user's Mumbai VPN range) + a couple of stale /32s. ⚠️ User IP flaps with VPN; re-add current IP if SSH times out: `aws ec2 authorize-security-group-ingress --group-id sg-0680b4005b958b5c8 --protocol tcp --port 22 --cidr $(curl -s checkip.amazonaws.com)/32 --region ap-south-1`.
+
+**Serving (proven working):** vLLM **v0.23.0** image `vllm/vllm-openai:latest` serves Qwen3-VL-8B fine (resolves `Qwen3VLForConditionalGeneration`). Command used:
+`docker run -d --name vllm --gpus all -p 8000:8000 -v $HOME/.cache/huggingface:/root/.cache/huggingface vllm/vllm-openai:latest --model Qwen/Qwen3-VL-8B-Instruct --served-model-name qwen3vl --max-model-len 8192 --gpu-memory-utilization 0.92`. Weights ~16GB download ~140s; loads in a few min. Comparators (Chandra-2, DeepSeek-OCR-2) not yet served.
+
+**To RESUME:** `aws ec2 start-instances --instance-ids i-06267ed13fcb663b4 --region ap-south-1`; the **public IP changes on each start** (no Elastic IP) — re-fetch via `describe-instances`; ensure SG allows current IP; `ssh ... ubuntu@<ip> 'docker start vllm'` (container preserved); wait for `/v1/models` to list `qwen3vl`; then from Mac open a tunnel `ssh -i ~/.ssh/ems-gpu.pem -L 8000:localhost:8000 ubuntu@<ip>` and run `python3 -m ocr.cli <pdf> --extractor vllm --host http://localhost:8000 --model qwen3vl`.
+
+**Cost discipline:** ~$1/hr while running; STOP when idle (`aws ec2 stop-instances ...`) — stopped = only EBS (~$/mo). ⚠️ Data residency: instance is in ap-south-1 (India) — keep real roll PII on this box, never the US hosted APIs (NVIDIA build.nvidia.com ToS bans PII; see gpu research). **Status when stopped: was ~1 min from first GPU extraction — pick up there.**
+
+---
+
+## 19. Download pipeline (BUILT — `scraper/`) — Option 1, now in progress
+Decision (2026-06-24): build the **real downloader** before the GPU OCR bake-off. The PoC (`eci_spike/step_final.js`) was a hardcoded one-shot with the agent solving the captcha — not a pipeline. New subsystem lives in-repo at **`scraper/`** (Node, **zero runtime deps**: `node:sqlite` + global `fetch`, Node ≥22; Playwright for the browser leg). Code is committed; `scraper/{node_modules,data}/` + `*.db` are gitignored (rolls = PII).
+
+**Two planes:**
+- **Data plane (manifest / completeness denominator)** — `scraper/bin/crawl-manifest.js` crawls the OPEN catalog (`/common/states`, `/common/districts/{cd}`, `/common/constituencies?stateCode={cd}` — 200 from any IP, no captcha). ✅ Ran clean: **36 states, 787 districts, 4,129 ACs, 0 errors** into `scraper/manifest.db`. Counts validate vs reality (UP 403, MH 288…); 0 null extractions. Keys mirror `db/schema.sql` geography (`state_cd`/`district_cd`/`ac_no`). Raw API JSON stored per row (resilient to shape drift); bonus fields captured for free: native-lang AC name (`asmblyNameL1`), `pcNo`. `download_job` state-machine table built, awaiting seed.
+- **Control plane (download)** — needs the **browser** (runs ECI's AES crypto + renders captcha, §6) and an **Indian IP** (geo-fenced; user's VPN gives ap-south egress even though ipinfo shows NL). `scraper/lib/browser.js` distills the proven PoC cascade-fill.
+
+**★ Captcha-scope finding (architecture-deciding, proven on Lakshadweep U06 twice):** **ONE captcha covers a whole multi-part AC selection.** Check N parts → solve 1 captcha → `POST printing-publish/generate-published-pdfs` returns `{status:"Success", payload:[<N UUIDs>]}` (Success **iff** captcha correct → a free correctness oracle). 10 parts → 1 captcha → 10 UUIDs → **10/10 PDFs delivered**. ⇒ captcha unit = **(AC × year × roll_type × language) ≈ low thousands nationally**, NOT per-part (~1M). Three orders of magnitude.
+
+**Delivery mechanism (fully mapped):** per UUID, `GET https://gateway-vpd.eci.gov.in/api/v1/ext-printing-publish/get-published-file?fileId=<uuid>` → the PDF (browser download event). **No further captcha**, different host (`gateway-vpd`), ~8–9s each, parallelizable/retryable. ⚠️ The page's on-screen "Success/Error x/10" counter is **bogus** (ticked Error 9/10 while all 10 downloaded fine) — trust the `get-published-file` 200 + saved bytes, not the UI. Filename: `{year}-EROLLGEN-{stateCd}-{acNo}-{rollType}-Revision{n}-{LANG}-{partNo}-WI.pdf`.
+
+**Cascade selects (Lakshadweep, discovered):** State → **Year** (2026/2025/2024) → **Roll** (`Supplement-2 2026` / `SIR FinalRoll - 2026` / `SIR DraftRoll - 2026`) → District → **AC** (react-select) → **Language** (ENGLISH/MALAYALAM). `stateCd`/`year` are AES-encrypted tokens in the publish endpoints (browser handles it).
+
+**Captcha solver (BUILT, DEPLOYED, self-training) — `scraper/captcha_solver/`:** pluggable `getSolver('manual'|'trocr')`. The autonomous solver is a **fine-tuned TrOCR** (pretrained text-recognition transformer), trained on the Mac M3 GPU (PyTorch MPS, `scraper/.venv` Python 3.12). A from-scratch CNN was tried and **failed** (~100 labels → chance-level generalization; synthetic pretraining didn't transfer — the whole CNN/synthetic experiment was removed in cleanup). TrOCR fine-tuned on ~100 hand-labels (via the `montage.py` grid-labeler) → **81% char / 35% exact** on held-out real captchas; **proven live** (solved a real ECI captcha → downloaded + verified, zero agent). Deployable at 35% because retry + the Success oracle → effective per-AC success ≈ `1−0.65^N`. **Self-training loop:** every correct live solve is saved as a verified `(image→answer)` pair in `data/captchas/verified/labels.csv`; re-run `train_trocr` with those folded in → accuracy climbs, no hand-labeling. Serve: `python -m captcha_solver.trocr_serve` (:8077) ← `--solver trocr`. Files: `captcha_solver/{train_trocr,trocr_serve,montage}.py` + `labels.csv` (seed), `README.md`.
+
+**Files:** `scraper/lib/{api,manifest,browser}.js`, `scraper/bin/{crawl-manifest,probe-captcha-scope,enumerate-parts}.js`.
+
+**Robot loop / orchestrator (BUILT & PROVEN end-to-end on Lakshadweep):** decision (user) = **lazy per-AC enumeration**, not a separate up-front pass — enumerating an AC's parts and downloading them use the SAME page visit, so the robot reads the part list, seeds the parts `pending`, then downloads in one go (no double-visit, no staleness). Files: `scraper/lib/download.js` (`downloadAc`: cascade → `readParts`+seed pending → select not-yet-verified parts → solve 1 captcha (retry-on-reject by reloading) → wait per-UUID downloads → verify `%PDF`+`pdfinfo` page count + sha256 → `markJob` verified/failed), `scraper/lib/captcha.js` (pluggable `getSolver('manual'|'trocr')` — manual=file-handoff bootstrap, trocr=fine-tuned TrOCR over HTTP :8077; on each Success it saves a verified captcha label for self-training), `scraper/bin/download.js` (driver: discover AC coords → run robot per AC; English-first, one language per part). **Proven:** Lakshadweep U06 ENG → 10 parts, 1 captcha, **10/10 downloaded + verified** (distinct sha256, page counts 12–41), to `scraper/data/rolls/U06/1/`; **part-level resume works** (re-run → 0 downloads, 0 captchas, skips verified). Browser context is `deviceScaleFactor:3` so live captcha screenshots match the solver's hi-res training data. The `enumerate-parts.js` standalone seeder still exists (enumeration-only / `ac_availability` menu).
+
+**Immediate next:** (a) **scale the download** — harden multi-AC/multi-district enumeration (`selectAcByIndex` index-walk is robust for single-AC states but needs type-to-filter for 200–400-AC states), then run real states with `--solver trocr` (English-first, one language per part). The solver self-improves during the run; periodically re-fine-tune on the accumulated `data/captchas/verified/labels.csv` to push past 35%. (b) test whether one captcha covers a *large* AC selection (300+ parts) or needs batching; (c) feed `scraper/data/rolls/` PDFs into the `ocr/` pipeline. (Downloaded so far: only Lakshadweep U06 AC1 SIR FinalRoll 2026, 10 parts, ENG.)
