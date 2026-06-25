@@ -9,6 +9,7 @@ archive/
 # operational manifest DB. Code under scraper/ IS committed; data is not.
 scraper/node_modules/
 scraper/data/
+scraper/.venv/
 *.db
 *.db-journal
 *.db-wal

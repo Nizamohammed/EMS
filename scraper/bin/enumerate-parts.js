@@ -11,8 +11,8 @@
 // Idempotent: re-running never clobbers an existing job's status.
 //
 // Usage:
-//   node bin/enumerate-parts.js --state Lakshadweep              # all langs, FinalRoll
-//   node bin/enumerate-parts.js --state Lakshadweep --languages english
+//   node bin/enumerate-parts.js --state Lakshadweep              # English-first, FinalRoll
+//   node bin/enumerate-parts.js --state Lakshadweep --languages all   # every language
 //   node bin/enumerate-parts.js --state Goa --roll FinalRoll --max-acs 2
 //
 // NOTE: AC selection by react-select index is robust for single-AC states; for
@@ -25,7 +25,7 @@ const B = require('../lib/browser');
 const DB_PATH = path.join(__dirname, '..', 'manifest.db');
 
 function parseArgs(argv) {
-  const a = { state: 'Lakshadweep', roll: 'FinalRoll', languages: 'all', maxAcs: 0, headful: false };
+  const a = { state: 'Lakshadweep', roll: 'FinalRoll', languages: 'english', maxAcs: 0, headful: false };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--state') a.state = argv[++i];
