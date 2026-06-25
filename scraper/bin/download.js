@@ -3,11 +3,12 @@
 // The robot driver. Walks the ACs of a state and runs the per-AC loop
 // (enumerate -> mark pending -> 1 captcha -> retrieve -> verify -> mark done),
 // resumable at part granularity. Captcha solving is pluggable: --solver manual
-// (file handoff, bootstrap) or --solver model (local qwen2.5vl).
+// (file handoff, bootstrap) or --solver trocr (the autonomous fine-tuned model,
+// served by captcha_solver/trocr_serve.py on :8077).
 //
 // Usage:
 //   node bin/download.js --state Lakshadweep --solver manual --languages english
-//   node bin/download.js --state Lakshadweep --solver model --max-acs 1
+//   node bin/download.js --state Lakshadweep --solver trocr --max-acs 1
 
 const path = require('path');
 const { Manifest } = require('../lib/manifest');
@@ -21,25 +22,25 @@ const WORK_DIR = path.join(__dirname, '..', 'data', '_work');
 
 function parseArgs(argv) {
   const a = {
-    state: 'Lakshadweep', roll: 'FinalRoll', languages: 'english', maxAcs: 0,
-    solver: 'manual', host: undefined, model: undefined, maxCaptchaAttempts: 4, headful: false,
+    state: 'Lakshadweep', roll: 'FinalRoll', languages: 'english', lang: null, maxAcs: 0,
+    solver: 'manual', host: undefined, maxCaptchaAttempts: 4, headful: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--state') a.state = argv[++i];
     else if (k === '--roll') a.roll = argv[++i];
     else if (k === '--languages') a.languages = argv[++i];
+    else if (k === '--lang') a.lang = argv[++i];
     else if (k === '--max-acs') a.maxAcs = Number(argv[++i]);
     else if (k === '--solver') a.solver = argv[++i];
     else if (k === '--host') a.host = argv[++i];
-    else if (k === '--model') a.model = argv[++i];
     else if (k === '--max-captcha-attempts') a.maxCaptchaAttempts = Number(argv[++i]);
     else if (k === '--headful') a.headful = true;
   }
   return a;
 }
 
-const langLabelsFor = (mode) => (mode === 'english' ? ['ENGLISH'] : ['ENGLISH']); // proof: English-first
+const langLabelsFor = (args) => (args.lang ? [args.lang] : ['ENGLISH']); // --lang overrides; default English-first
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -49,7 +50,6 @@ async function main() {
 
   const solverOpts = { workdir: WORK_DIR };
   if (args.host) solverOpts.host = args.host;
-  if (args.model) solverOpts.model = args.model;
   const solver = getSolver(args.solver, solverOpts);
 
   const { browser, page } = await B.launchSession({ headless: !args.headful });
@@ -81,7 +81,7 @@ async function main() {
     for (const c of coords) {
       const acRow = m.findAc(stateCd, c.acLabel);
       if (!acRow) { console.log(`! AC "${c.acLabel}" not in manifest — skip`); continue; }
-      for (const language of langLabelsFor(args.languages)) {
+      for (const language of langLabelsFor(args)) {
         try {
           const s = await downloadAc(page, m, solver, {
             stateCd, state: args.state, roll: args.roll, districtLabel: c.districtLabel,

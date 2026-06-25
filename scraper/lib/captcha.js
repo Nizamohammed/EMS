@@ -34,39 +34,29 @@ class ManualSolver {
   }
 }
 
-// Local small VLM via Ollama — the "ML model in the loop". Not perfect per-solve
-// (~5/6 chars observed); relies on the orchestrator's retry + Success oracle.
-class ModelSolver {
-  constructor({ host = 'http://localhost:11434', model = 'qwen2.5vl:3b' } = {}) {
+// Our fine-tuned TrOCR model, served by captcha_solver/trocr_serve.py over HTTP
+// (the autonomous scale path). Solving is a POST of the captcha PNG bytes.
+class TrocrSolver {
+  constructor({ host = 'http://127.0.0.1:8077' } = {}) {
     this.host = host;
-    this.model = model;
   }
   async solve(pngPath) {
-    const img = fs.readFileSync(pngPath).toString('base64');
-    const body = JSON.stringify({
-      model: this.model,
-      prompt:
-        'This is a CAPTCHA image with about 6 alphanumeric characters (letters and digits, ' +
-        'possibly mixed case) with a distracting line drawn through them. Read the characters ' +
-        'exactly. Respond with ONLY the characters as one string: no spaces, no punctuation.',
-      images: [img],
-      stream: false,
-      options: { temperature: 0 },
-    });
-    const res = await fetch(`${this.host}/api/generate`, {
+    const buf = fs.readFileSync(pngPath);
+    const res = await fetch(`${this.host}/solve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: buf,
     });
     const j = await res.json();
-    return (j.response || '').replace(/[^A-Za-z0-9]/g, '').trim();
+    if (j.error) throw new Error(`trocr solver: ${j.error}`);
+    return (j.text || '').trim();
   }
 }
 
 function getSolver(name, opts = {}) {
   if (name === 'manual') return new ManualSolver(opts);
-  if (name === 'model') return new ModelSolver(opts);
+  if (name === 'trocr') return new TrocrSolver(opts);
   throw new Error(`unknown captcha solver: ${name}`);
 }
 
-module.exports = { getSolver, ManualSolver, ModelSolver };
+module.exports = { getSolver, ManualSolver, TrocrSolver };

@@ -19,6 +19,7 @@ async function launchSession({ downloadDir, headless = true } = {}) {
   const ctx = await browser.newContext({
     userAgent: UA,
     viewport: { width: 1366, height: 900 },
+    deviceScaleFactor: 3, // hi-res captcha screenshots, matching the CNN's training data
     acceptDownloads: true,
   });
   const page = await ctx.newPage();

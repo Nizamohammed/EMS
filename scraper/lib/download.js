@@ -150,7 +150,21 @@ async function downloadAc(page, m, solver, ctx) {
       const resp = await genP;
       let json = null;
       if (resp) { try { json = await resp.json(); } catch {} }
-      if (json && json.status === 'Success' && Array.isArray(json.payload)) { uuids = json.payload; break attempt; }
+      const accepted = !!(json && json.status === 'Success' && Array.isArray(json.payload));
+      console.log(`  [captcha] attempt ${attempts}/${ctx.maxCaptchaAttempts}: "${answer}" -> ${accepted ? 'ACCEPTED' : 'rejected'}`);
+      if (accepted) {
+        // self-training: the oracle just confirmed this answer is correct, so
+        // (captcha image -> answer) is a free verified label. Persist it.
+        try {
+          const vdir = path.join(ctx.dataDir, '..', 'captchas', 'verified');
+          fs.mkdirSync(vdir, { recursive: true });
+          const vname = `v_${answer}_${Math.random().toString(36).slice(2, 8)}.png`;
+          fs.copyFileSync(pngPath, path.join(vdir, vname));
+          fs.appendFileSync(path.join(vdir, 'labels.csv'), `${vname},${answer}\n`);
+        } catch (e) { /* best-effort */ }
+        uuids = json.payload;
+        break attempt;
+      }
       // wrong captcha (or transient) -> fresh page, fresh captcha, re-select
       const r2 = await cascadeToAc(page, ctx);
       parts = r2.parts;
