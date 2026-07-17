@@ -48,7 +48,8 @@ def _tokens(image_path):
     for box, text, conf in (res or []):
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
-        out.append({"x": min(xs), "y": min(ys), "x2": max(xs), "text": text.strip(), "conf": conf})
+        out.append({"x": min(xs), "y": min(ys), "x2": max(xs), "y2": max(ys),
+                    "text": text.strip(), "conf": conf})
     return out
 
 
@@ -282,16 +283,180 @@ def _parse_summary(image_path):
     return out
 
 
+def _despace(s):
+    return re.sub(r"\s+", "", s or "")
+
+
+def _cover_find(toks, needle):
+    """Token matching needle (despaced, case-insensitive). Prefer an EXACT label token
+    (so 'block' hits the 'Block' label, not the '1-Block1' section) before falling back
+    to a containing token (for embedded labels like '...Assembly Constituency: ...')."""
+    n = _despace(needle).lower()
+    exact = [t for t in toks if _despace(t["text"]).lower() == n]
+    if exact:
+        return min(exact, key=lambda d: d["y"])
+    cands = [t for t in toks if n in _despace(t["text"]).lower()]
+    return min(cands, key=lambda d: d["y"]) if cands else None
+
+
+def _value_right(toks, label, row_tol=0.6):
+    """The value token to the right of a label token on the same row (strips a leading ':').
+
+    row_tol is a fraction of the label token's height so this stays DPI-independent.
+    Falls back to text after ':' inside the label token itself.
+    """
+    c = _cover_find(toks, label)
+    if not c:
+        return None
+    h = max(12.0, (c.get("y2", c["y"]) - c["y"]) or 12.0)
+    rights = [t for t in toks if abs(t["y"] - c["y"]) < row_tol * h and t["x"] > c["x"] + 5]
+    if rights:
+        v = min(rights, key=lambda d: d["x"])["text"]
+    elif ":" in c["text"]:
+        v = c["text"]
+    else:
+        return None
+    v = (v.split(":", 1)[1] if ":" in v else v).strip()
+    return v or None
+
+
+def _value_below(toks, label, max_gap=2.2):
+    """The first token below a label token (same-ish column), within max_gap label-heights."""
+    c = _cover_find(toks, label)
+    if not c:
+        return None
+    h = max(12.0, (c.get("y2", c["y"]) - c["y"]) or 12.0)
+    # clearly below (skip same-row neighbours), within max_gap rows, roughly same column
+    below = [t for t in toks if c["y"] + 0.6 * h < t["y"] < c["y"] + max_gap * h
+             and t["x"] < c["x"] + 8 * h]
+    if not below:
+        return None
+    v = min(below, key=lambda d: (d["y"], d["x"]))["text"]
+    return (v.split(":", 1)[1] if ":" in v else v).strip() or None
+
+
+def _cons(toks, label):
+    """Parse a '...Constituency :: {no}-{NAME}({RES})' line -> (no, name, reservation)."""
+    t = _cover_find(toks, label)
+    if not t:
+        return None
+    tail = t["text"].split(":")[-1]
+    m = re.search(r"(\d+)\s*-\s*(.+?)\s*\(([A-Za-z]+)\)", tail)
+    if m:
+        return int(m.group(1)), m.group(2).strip(), m.group(3).upper()
+    m = re.search(r"(\d+)\s*-\s*(.+)$", tail)
+    return (int(m.group(1)), m.group(2).strip(), None) if m else None
+
+
 def _parse_cover(image_path):
-    """Best-effort labeled cover fields (not load-bearing; reconcile uses the summary)."""
+    """Structured cover fields: identity (state/AC/PC/part), revision metadata, area +
+    polling-station details, sections, and the 'Number of Electors' table (a second
+    checksum cross-checked against the summary in reconcile via cover_count)."""
     toks = _tokens(image_path)
-    text = {t["text"].lower(): t["text"] for t in toks}
+    if not toks:
+        return {}
     out = {}
-    for t in toks:
-        low = t["text"].lower()
-        m = re.search(r"district\s*[:\-]?\s*(.+)", low)
-        if m and not out.get("district_name"):
-            out["district_name"] = _strip_label(t["text"])
+
+    # --- title: "ELECTORAL ROLL {year}{stateCd}{stateName}" ---
+    title = _cover_find(toks, "electoralroll")
+    if title:
+        m = re.search(r"electoral\s*roll\s*(\d{4})\s*[su]\d{2}\s*(.+)", title["text"], re.I)
+        if m:
+            out["year_of_revision"] = int(m.group(1))
+            out["state_name"] = m.group(2).strip()
+
+    # --- Assembly / Parliamentary constituency lines ---
+    ac = _cons(toks, "assemblyconstituency")
+    if ac:
+        out["ac_no"], out["ac_name"], out["ac_reservation"] = ac
+    pc = _cons(toks, "parliamentaryconstituency")
+    if pc:
+        out["pc_no"], out["pc_name"] = pc[0], pc[1]
+    part = _cover_find(toks, "partno")
+    if part:
+        m = re.search(r"(\d+)", part["text"].split(":")[-1])
+        if m:
+            out["part_no"] = int(m.group(1))
+
+    # --- revision details (label : value on the same row) ---
+    yr = _value_right(toks, "yearofrevision")
+    if yr and re.search(r"\d{4}", yr):
+        out.setdefault("year_of_revision", int(re.search(r"\d{4}", yr).group()))
+    for key, label in (("qualifying_date", "qualifyingdate"),
+                       ("date_of_publication", "dateofpublication"),
+                       ("date_of_updation", "dateofupdation"),
+                       ("type_of_revision", "typeofrevision")):
+        v = _value_right(toks, label)
+        if v:
+            out[key] = v
+    # roll identification prints BELOW its header, not to the right
+    ri = _value_below(toks, "rollidentification")
+    if ri:
+        out["roll_identification"] = ri
+
+    # --- area details (right-hand column of section 2) ---
+    for key, label in (("main_town_or_village", "maintownorvillage"), ("post_office", "postoffice"),
+                       ("police_station", "policestation"), ("block", "block"),
+                       ("tehsil_mandal", "tehsil"), ("taluk", "taluk"),
+                       ("district_name", "district"), ("pin_code", "pincode")):
+        v = _value_right(toks, label)
+        if v:
+            out[key] = v
+    if out.get("pin_code"):
+        m = re.search(r"\d{6}", _despace(out["pin_code"]))
+        out["pin_code"] = m.group() if m else None
+
+    # --- polling station (section 3) ---
+    ps = _value_below(toks, "nameofpollingstation")
+    if ps:
+        m = re.match(r"(\d+)\s*-\s*(.+)", ps)
+        if m:
+            out["polling_station_no"], out["polling_station_name"] = int(m.group(1)), m.group(2).strip()
+        else:
+            out["polling_station_name"] = ps
+    pst = _value_right(toks, "typeofpollingstation")
+    if pst and re.search(r"male|female|general", pst, re.I):
+        out["polling_station_type"] = pst
+    addr = _value_below(toks, "addressofpollingstation")
+    if addr:
+        out["polling_station_address"] = addr
+    aux = _value_right(toks, "auxiliarypolling") or _value_right(toks, "stationsinthispart")
+    if aux and re.search(r"\d", aux):
+        out["num_auxiliary_stations"] = int(re.search(r"\d+", aux).group())
+
+    # --- sections: "{no}-{name}" tokens under the sections header, left column ---
+    sh = _cover_find(toks, "sectionsinthepart")
+    if sh:
+        h = max(12.0, (sh.get("y2", sh["y"]) - sh["y"]) or 12.0)
+        secs = []
+        for t in toks:
+            if sh["y"] < t["y"] < sh["y"] + 6 * h and t["x"] < sh["x"] + 12 * h:
+                m = re.match(r"(\d+)\s*-\s*(.+)", t["text"].strip())
+                if m:
+                    secs.append({"section_no": int(m.group(1)), "section_name": m.group(2).strip()})
+        if secs:
+            out["sections"] = secs
+
+    # --- "NUMBER OF ELECTORS" table: map the value row to columns by header x ---
+    def _hx(*names):
+        want = set(names)
+        cand = [t for t in toks if _despace(t["text"]).lower() in want]
+        return min(cand, key=lambda d: d["y"]) if cand else None
+    hdrs = {"starting_serial_no": _hx("starting"), "ending_serial_no": _hx("ending"),
+            "net_male": _hx("male"), "net_female": _hx("female"),
+            "net_third_gender": _hx("thirdgender", "third"), "net_total": _hx("total")}
+    anchors = {k: t["x"] for k, t in hdrs.items() if t}
+    if anchors:
+        base_y = max(t["y"] for t in hdrs.values() if t)
+        row_h = max(12.0, min((t.get("y2", t["y"]) - t["y"]) or 12.0 for t in hdrs.values() if t))
+        nums = [t for t in toks if base_y < t["y"] < base_y + 3 * row_h
+                and re.fullmatch(r"\d{1,6}", t["text"].strip())]
+        if nums:
+            first_y = min(t["y"] for t in nums)
+            row = [t for t in nums if abs(t["y"] - first_y) < 1.2 * row_h]
+            for t in row:
+                col = min(anchors, key=lambda k: abs(anchors[k] - t["x"]))
+                out.setdefault(col, int(t["text"].strip()))
     return out
 
 
