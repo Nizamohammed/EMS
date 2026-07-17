@@ -88,9 +88,28 @@ def assemble(cards: list[CardRecord]) -> list[CardRecord]:
         c.gender = _norm_gender(c.gender)
         if c.epic_no:
             c.epic_no = c.epic_no.strip().upper().replace(" ", "")
+        # the model sometimes echoes the legend ("E/S/R/M/Q") into the reason code;
+        # only a single valid letter is a real deletion reason, else drop it
+        if c.deletion_reason_code and c.deletion_reason_code.strip() not in _REASONS:
+            c.deletion_reason_code = None
         prev = best.get(c.serial_no)
         if prev is None or _completeness(c) > _completeness(prev):
             best[c.serial_no] = c
+
+    # Section guard: 'List of Additions/Deletions' supplements are a TRAILING block
+    # whose serials continue PAST the main roll. A bottom-half crop has no visible
+    # section header, so the model sometimes guesses 'additions' for a main-roll
+    # strip; those cards' serials interleave inside the main-roll range. Reclassify
+    # any supplement-tagged card whose serial sits within the main-roll span back to
+    # main_roll — only the trailing serial block is a genuine supplement.
+    # (Assumes supplements continue numbering. Rolls whose supplement RESETS serials
+    #  need section-aware dedup; validate the multi-supplement case on more rolls.)
+    main_max = max((c.serial_no for c in best.values() if c.region == "main_roll"),
+                   default=None)
+    if main_max is not None:
+        for c in best.values():
+            if c.region in ("additions", "deletions") and c.serial_no <= main_max:
+                c.region = "main_roll"
 
     out = []
     for sn in sorted(best):

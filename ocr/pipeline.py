@@ -16,13 +16,22 @@ from .reconcile import reconcile
 from .types import CardRecord, SummaryFigures, RollContext, RollResult
 
 
-def _region(header: str) -> str:
-    h = (header or "").lower()
+def _region(header: str):
+    """Region implied by a strip's header, or None when the strip has no header.
+
+    A 'List of Additions/Deletions' header appears ONCE at the top of a section
+    that then spans several pages; the continuation pages (and every bottom-half
+    crop) carry no header. Returning None for those lets the caller carry the
+    last-seen section forward instead of silently defaulting them to main_roll.
+    """
+    h = (header or "").lower().replace(" ", "")
     if "addition" in h:
         return "additions"
     if "deletion" in h:
         return "deletions"
-    return "main_roll"
+    if "sectionno" in h:
+        return "main_roll"
+    return None
 
 
 def _to_card(d: dict, region: str, supp, page: int) -> CardRecord:
@@ -87,6 +96,8 @@ def run_roll(pdf_path: str, ctx: RollContext, extractor: Extractor,
     # voter cards — a failure on one crop skips it and continues (don't lose the whole roll)
     raw: list[CardRecord] = []
     failures: list[str] = []
+    current_region = "main_roll"          # carried forward across headerless strips
+    current_supp = None
     for (page, band, path) in voter:
         t0 = time.monotonic()
         try:
@@ -97,8 +108,11 @@ def run_roll(pdf_path: str, ctx: RollContext, extractor: Extractor,
                 print(f"[extract] p{page}/{band} FAILED ({time.monotonic() - t0:.1f}s): {e}")
             continue
         header = pd.get("section_header", "")
-        region = _region(header)
-        supp = _supplement_no(header) if region in ("additions", "deletions") else None
+        r = _region(header)
+        if r is not None:                 # a new header starts a section; else continue the last
+            current_region = r
+            current_supp = _supplement_no(header) if r in ("additions", "deletions") else None
+        region, supp = current_region, current_supp
         for d in pd.get("cards", []):
             try:
                 raw.append(_to_card(d, region, supp, page))
