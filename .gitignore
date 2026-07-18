@@ -17,3 +17,6 @@ scraper/.venv/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Scratch copy-paste of prior agent session — not project documentation
+lastagentconverstaion.md

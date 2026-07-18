@@ -40,8 +40,13 @@ def _context_from_filename(path: str) -> RollContext:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="EMS OCR pipeline")
     ap.add_argument("pdf")
-    ap.add_argument("--extractor", default="qwen2.5vl", help=f"one of: {available()}")
-    ap.add_argument("--model", default=None, help="model id for the extractor (e.g. qwen2.5vl:3b)")
+    ap.add_argument("--extractor", default="rapidocr", help=f"one of: {available()}")
+    ap.add_argument("--model", default=None, help="model id for the extractor")
+    ap.add_argument("--deleted-backend", default="none", choices=["none", "dp", "local", "http"],
+                    help="how DELETED cards are re-read: none=RapidOCR only; "
+                         "dp=Donut+Pix2Struct recover stamped cards, no Qwen (free, local); "
+                         "local=dp+Qwen adapter on this machine; http=dp+Qwen served over HTTP")
+    ap.add_argument("--qwen-host", default=None, help="URL of a served Qwen2.5-VL for --deleted-backend http")
     ap.add_argument("--out", default=None, help="write full result JSON here")
     ap.add_argument("--sql-out", default=None, help="write loadable SQL (for db/schema.sql) here")
     ap.add_argument("--workdir", default=None, help="dir for page crops (default: temp)")
@@ -55,7 +60,9 @@ def main(argv=None) -> int:
         print(f"no such file: {args.pdf}", file=sys.stderr)
         return 2
 
-    kw = {"model": args.model} if args.model else {}
+    kw = {"deleted_backend": args.deleted_backend, "qwen_host": args.qwen_host, "dpi": args.dpi}
+    if args.model:
+        kw["model"] = args.model
     try:
         extractor = get_extractor(args.extractor, **kw)
     except ValueError as e:

@@ -116,6 +116,26 @@ create table section (
     unique (part_id, section_no)
 );
 
+-- A delimitation era = a constituency-boundary regime. Boundaries (and the ac_no /
+-- part_no numbering keyed to them) are redrawn ~decadally; the SAME physical area can
+-- carry different (ac_no, part_no) identities in different eras. Every roll records
+-- which era its geography belongs to, so a post-redelimitation roll never conflates
+-- with a pre- one on the reused numbering. This table + roll.era_id are the
+-- forward-compatible hook; the FULL era-scoped geography + successor/predecessor
+-- lineage model is specified in db/TEMPORAL_GEOGRAPHY.md (implemented when we first
+-- ingest across a boundary change — the 2026 rolls are all one era).
+create table delimitation_era (
+    era_id          bigint generated always as identity primary key,
+    era_name        text not null unique,
+    effective_from  date,
+    effective_to    date                       -- null = current era
+);
+
+-- India's Assembly/Parliamentary constituencies still use the 2008 Delimitation; the
+-- 2026 Special Intensive Revision is a roll revision, NOT a re-delimitation, so every
+-- roll we currently ingest belongs to this single era.
+insert into delimitation_era (era_name, effective_from) values ('2008 Delimitation', '2008-02-19');
+
 -- ----------------------------------------------------------------------------
 -- Layer 2 — Roll snapshot (faithful, versioned record of each published PDF)
 -- ----------------------------------------------------------------------------
@@ -123,6 +143,7 @@ create table section (
 create table roll (
     roll_id              bigint generated always as identity primary key,
     part_id              bigint not null references part(part_id),
+    era_id               bigint references delimitation_era(era_id),  -- delimitation era of this roll's geography
     year_of_revision     integer not null,
     qualifying_date      date,                 -- "Age as on"
     type_of_revision     text,                 -- e.g. "Special Summary Revision 2026"
@@ -254,11 +275,28 @@ create table cover_count (
 -- Layer 4 — Derived identity (Tier 1: EPIC-keyed; Tier 2 fuzzy = stub via match_method)
 -- ----------------------------------------------------------------------------
 
--- One actual human, deduplicated across rolls. Tier 1 keys on EPIC.
+-- One actual human, deduplicated across rolls.
+-- Identity is anchored by the person's EPIC set (person_epic) + optional Tier-2 fuzzy.
 create table person (
     person_id       bigint generated always as identity primary key,
-    epic_no         text not null unique,      -- Tier-1 identity anchor (persons w/o EPIC are a Tier-2 concern)
+    epic_no         text unique,               -- PRIMARY EPIC (nullable): the EPIC this person was first
+                                                -- created under. The FULL set of a person's EPICs lives in
+                                                -- person_epic (a re-issued card gives the same human a new
+                                                -- EPIC; a Tier-2 merge folds two EPIC-persons into one).
+                                                -- Nullable so a fuzzy-matched person with no EPIC can exist.
     canonical_name  text
+);
+
+-- Every EPIC that resolves to a person. One person may hold several EPICs over time;
+-- an EPIC identifies exactly one person (unique). This is what lets a voter who moved
+-- and got a NEW card, or a duplicate that gets merged, collapse to a single person
+-- without losing either appearance. Populated at Tier-1 (one row per new EPIC); the
+-- Tier-2 fuzzy matcher adds rows to fold re-issued/duplicate EPICs under one person.
+create table person_epic (
+    person_epic_id  bigint generated always as identity primary key,
+    person_id       bigint not null references person(person_id) on delete cascade,
+    epic_no         text not null unique,
+    first_roll_id   bigint references roll(roll_id)   -- roll this EPIC was first seen in
 );
 
 -- Bridge: links one person to one elector appearance => the person's timeline.
@@ -284,6 +322,7 @@ create index ix_ac_pc                       on assembly_constituency(pc_id);
 create index ix_part_ac                     on part(ac_id);
 create index ix_section_part                on section(part_id);
 create index ix_roll_part                   on roll(part_id);
+create index ix_roll_era                    on roll(era_id);
 create index ix_supplement_roll             on supplement(roll_id);
 create index ix_elector_roll                on elector(roll_id);
 create index ix_elector_section             on elector(section_id);
@@ -292,6 +331,7 @@ create index ix_elector_epic                on elector(epic_no);
 create index ix_summary_row_summary         on summary_row(summary_id);
 create index ix_summary_row_supplement      on summary_row(supplement_id);
 create index ix_placement_person            on placement(person_id);
+create index ix_person_epic_person          on person_epic(person_id);
 
 -- ----------------------------------------------------------------------------
 -- QC helper — reconcile extracted electors against the printed checksums.
@@ -325,6 +365,39 @@ left join elector e      on e.roll_id = r.roll_id
 left join summary s      on s.roll_id = r.roll_id
 left join cover_count cc on cc.roll_id = r.roll_id
 group by r.roll_id, s.net_total, s.net_male, s.net_female, s.net_third_gender, cc.net_total;
+
+-- ----------------------------------------------------------------------------
+-- Person lifecycle — each person's CURRENT status, DERIVED from their most recent
+-- appearance across all ingested rolls. Never mutates data: a deceased / shifted /
+-- disqualified person is MARKED here, never deleted. The status self-corrects as
+-- more rolls land (someone 'shifted_out' of part A reads 'active' again once part B's
+-- roll — where they were re-added — becomes their latest appearance).
+-- Answers: "did this person move / die / get disqualified, and where are they now?"
+-- ----------------------------------------------------------------------------
+create view v_person_current as
+select distinct on (p.person_id)
+    p.person_id,
+    e.epic_no,
+    coalesce(p.canonical_name, e.full_name)     as name,
+    e.roll_id                                   as latest_roll_id,
+    r.part_id                                   as latest_part_id,
+    r.date_of_publication                       as latest_publication,
+    e.entry_status,
+    e.deletion_reason_code,
+    case
+        when e.entry_status <> 'deleted'  then 'active'
+        when e.deletion_reason_code = 'E' then 'deceased'
+        when e.deletion_reason_code = 'S' then 'shifted_out'
+        when e.deletion_reason_code = 'R' then 'removed_duplicate'
+        when e.deletion_reason_code = 'Q' then 'disqualified'
+        when e.deletion_reason_code = 'M' then 'removed_missing'
+        else 'removed'
+    end                                         as lifecycle_status
+from person p
+join placement pl on pl.person_id = p.person_id
+join elector e    on e.elector_id = pl.elector_id
+join roll r       on r.roll_id    = e.roll_id
+order by p.person_id, r.date_of_publication desc nulls last, e.roll_id desc, e.elector_id desc;
 
 -- ============================================================================
 -- DEFERRED EXTENSION POINTS (not part of v1 core — documented hooks)
